@@ -1,0 +1,97 @@
+{
+  "Comment": "claim-adjudication-engine Step Functions workflow. Orchestrates eligibility, coverage rules, medical necessity, fraud scoring, and decision writing for each claim.",
+  "StartAt": "CheckEligibility",
+  "States": {
+    "CheckEligibility": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:check-member-eligibility",
+      "Comment": "Validates member eligibility via internal eligibility service API",
+      "ResultPath": "$.eligibility",
+      "Retry": [{ "ErrorEquals": ["States.TaskFailed"], "MaxAttempts": 2, "IntervalSeconds": 5 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "HandleEligibilityError" }],
+      "Next": "IsEligible"
+    },
+    "IsEligible": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.eligibility.is_eligible",
+          "BooleanEquals": false,
+          "Next": "DenyIneligible"
+        }
+      ],
+      "Default": "RunCoverageRules"
+    },
+    "DenyIneligible": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:write-adjudication-decision",
+      "Parameters": {
+        "decision": "DENIED",
+        "reason_code": "ELIG_FAIL",
+        "claim_id.$": "$.claim_id"
+      },
+      "End": true
+    },
+    "RunCoverageRules": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "coverage-rules-engine",
+        "Arguments": {
+          "--claim_id.$": "$.claim_id",
+          "--policy_number.$": "$.policy_number",
+          "--claim_type.$": "$.claim_type"
+        }
+      },
+      "ResultPath": "$.coverage",
+      "Next": "EvaluateMedicalNecessity"
+    },
+    "EvaluateMedicalNecessity": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:medical-necessity-scorer",
+      "Comment": "Known issue CAE-007: SageMaker cold start adds ~45s on first call per hour",
+      "ResultPath": "$.necessity",
+      "Next": "MakeDecision"
+    },
+    "MakeDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.necessity.decision",
+          "StringEquals": "DENIED",
+          "Next": "WriteDecision"
+        },
+        {
+          "Variable": "$.necessity.decision",
+          "StringEquals": "PENDED",
+          "Next": "RouteToManualReview"
+        }
+      ],
+      "Default": "WriteDecision"
+    },
+    "RouteToManualReview": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage",
+      "Parameters": {
+        "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789/claims-manual-review-queue",
+        "MessageBody.$": "States.JsonToString($)"
+      },
+      "End": true
+    },
+    "WriteDecision": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:write-adjudication-decision",
+      "End": true
+    },
+    "HandleEligibilityError": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:123456789:function:write-adjudication-decision",
+      "Parameters": {
+        "decision": "PENDED",
+        "reason_code": "ELIG_ERROR",
+        "claim_id.$": "$.claim_id"
+      },
+      "End": true
+    }
+  }
+}
